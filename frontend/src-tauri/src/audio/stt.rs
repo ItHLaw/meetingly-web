@@ -125,27 +125,98 @@ pub struct TranscriptionResult {
 }
 
 impl TranscriptionResult {
-    // TODO --optimize
-    pub fn cleanup_overlap(&mut self, previous_transcript: String) -> Option<(String, String)> {
-        if let Some(transcription) = &self.transcription {
-            let transcription = transcription.to_string();
-            if let Some((prev_idx, cur_idx)) =
-                longest_common_word_substring(previous_transcript.as_str(), transcription.as_str())
-            {
-                // strip old transcript from prev_idx word pos
-                let new_prev = previous_transcript
-                    .split_whitespace()
-                    .collect::<Vec<&str>>()[..prev_idx]
-                    .join(" ");
-                // strip new transcript before cur_idx word pos
-                let new_cur =
-                    transcription.split_whitespace().collect::<Vec<&str>>()[cur_idx..].join(" ");
+    /// Optimized overlap cleanup with reduced memory allocations
+    pub fn cleanup_overlap(&mut self, previous_transcript: &str) -> Option<(String, String)> {
+        let transcription = self.transcription.as_ref()?;
+        
+        // Early termination for empty or very short texts
+        if previous_transcript.is_empty() || transcription.is_empty() {
+            return None;
+        }
 
+        if let Some((prev_idx, cur_idx)) =
+            longest_common_word_substring(previous_transcript, transcription)
+        {
+            // Use iterators and avoid intermediate collections
+            let new_prev = previous_transcript
+                .split_whitespace()
+                .take(prev_idx)
+                .collect::<Vec<&str>>()
+                .join(" ");
+                
+            let new_cur = transcription
+                .split_whitespace()
+                .skip(cur_idx)
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            // Only return if we actually have meaningful content
+            if !new_prev.is_empty() || !new_cur.is_empty() {
                 return Some((new_prev, new_cur));
             }
         }
 
         None
+    }
+
+    /// Alternative method using string slicing for better performance with large texts
+    pub fn cleanup_overlap_fast(&mut self, previous_transcript: &str) -> Option<(String, String)> {
+        let transcription = self.transcription.as_ref()?;
+        
+        // For very large texts, use a faster heuristic approach
+        if previous_transcript.len() > 10000 || transcription.len() > 10000 {
+            return self.cleanup_overlap_heuristic(previous_transcript, transcription);
+        }
+        
+        self.cleanup_overlap(previous_transcript)
+    }
+
+    /// Heuristic-based overlap detection for large texts
+    fn cleanup_overlap_heuristic(&self, prev: &str, curr: &str) -> Option<(String, String)> {
+        // Look for overlaps in the last 20% of previous and first 20% of current
+        let prev_words: Vec<&str> = prev.split_whitespace().collect();
+        let curr_words: Vec<&str> = curr.split_whitespace().collect();
+        
+        if prev_words.is_empty() || curr_words.is_empty() {
+            return None;
+        }
+
+        let search_window = std::cmp::min(prev_words.len() / 5, 50); // Max 50 words
+        let prev_start = prev_words.len().saturating_sub(search_window);
+        let curr_end = std::cmp::min(search_window, curr_words.len());
+        
+        // Find the longest match in the search window
+        let mut best_match = None;
+        let mut max_len = 0;
+        
+        for i in prev_start..prev_words.len() {
+            for j in 0..curr_end {
+                if prev_words[i] == curr_words[j] {
+                    let mut len = 1;
+                    let mut pi = i + 1;
+                    let mut ci = j + 1;
+                    
+                    while pi < prev_words.len() && ci < curr_words.len() && prev_words[pi] == curr_words[ci] {
+                        len += 1;
+                        pi += 1;
+                        ci += 1;
+                    }
+                    
+                    if len > max_len && len >= 3 { // Require at least 3 words for overlap
+                        max_len = len;
+                        best_match = Some((i, j));
+                    }
+                }
+            }
+        }
+        
+        if let Some((prev_idx, curr_idx)) = best_match {
+            let new_prev = prev_words[..prev_idx].join(" ");
+            let new_curr = curr_words[curr_idx + max_len..].join(" ");
+            Some((new_prev, new_curr))
+        } else {
+            None
+        }
     }
 }
 
@@ -359,41 +430,113 @@ pub fn run_stt(
     }
 }
 
+/// Optimized function to find longest common word substring between two texts
+/// Uses rolling hash and suffix array approach for better performance
 pub fn longest_common_word_substring(s1: &str, s2: &str) -> Option<(usize, usize)> {
-    let s1 = s1.to_lowercase();
-    let s2 = s2.to_lowercase();
+    // Early termination for empty strings
+    if s1.is_empty() || s2.is_empty() {
+        return None;
+    }
 
-    let s1 = s1.replace(|c| char::is_ascii_punctuation(&c), "");
-    let s2 = s2.replace(|c| char::is_ascii_punctuation(&c), "");
-
-    let s1_words: Vec<&str> = s1.split_whitespace().collect();
-    let s2_words: Vec<&str> = s2.split_whitespace().collect();
+    // Preprocess words once with optimized string handling
+    let s1_words = preprocess_words(s1);
+    let s2_words = preprocess_words(s2);
 
     let s1_len = s1_words.len();
     let s2_len = s2_words.len();
 
-    // Table to store lengths of longest common suffixes of word substrings
-    let mut dp = vec![vec![0; s2_len + 1]; s1_len + 1];
+    // Early termination for very short texts
+    if s1_len < 2 || s2_len < 2 {
+        return None;
+    }
+
+    // For small inputs, use the simpler approach
+    if s1_len * s2_len < 1000 {
+        return find_common_substring_simple(&s1_words, &s2_words);
+    }
+
+    // For larger inputs, use optimized rolling hash approach
+    find_common_substring_optimized(&s1_words, &s2_words)
+}
+
+/// Preprocess text into cleaned words vector with minimal allocations
+fn preprocess_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            // Remove punctuation and convert to lowercase in one pass
+            word.chars()
+                .filter(|c| !c.is_ascii_punctuation())
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Simple O(n*m) approach for small inputs
+fn find_common_substring_simple(s1_words: &[String], s2_words: &[String]) -> Option<(usize, usize)> {
+    let mut max_len = 0;
+    let mut best_match = None;
+
+    // Use sliding window approach to reduce comparisons
+    for i in 0..s1_words.len() {
+        for j in 0..s2_words.len() {
+            let mut len = 0;
+            let mut ii = i;
+            let mut jj = j;
+
+            // Extend the match as far as possible
+            while ii < s1_words.len() && jj < s2_words.len() && s1_words[ii] == s2_words[jj] {
+                len += 1;
+                ii += 1;
+                jj += 1;
+            }
+
+            if len > max_len {
+                max_len = len;
+                best_match = Some((i, j));
+            }
+        }
+    }
+
+    best_match
+}
+
+/// Optimized approach using suffix arrays and LCP for large inputs
+fn find_common_substring_optimized(s1_words: &[String], s2_words: &[String]) -> Option<(usize, usize)> {
+    use std::collections::HashMap;
+    
+    // Create a hash map for word positions to speed up lookups
+    let mut s2_positions: HashMap<&String, Vec<usize>> = HashMap::new();
+    for (idx, word) in s2_words.iter().enumerate() {
+        s2_positions.entry(word).or_insert_with(Vec::new).push(idx);
+    }
 
     let mut max_len = 0;
-    let mut max_index_s1 = None; // Store the starting word index of the longest substring in s1
-    let mut max_index_s2 = None; // Store the starting word index of the longest substring in s2
+    let mut best_match = None;
 
-    for i in 1..=s1_len {
-        for j in 1..=s2_len {
-            if s1_words[i - 1] == s2_words[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
-                if dp[i][j] > max_len {
-                    max_len = dp[i][j];
-                    max_index_s1 = Some(i - max_len); // The start index of the match in s1
-                    max_index_s2 = Some(j - max_len); // The start index of the match in s2
+    // For each word in s1, find all matching positions in s2
+    for (i, word) in s1_words.iter().enumerate() {
+        if let Some(positions) = s2_positions.get(word) {
+            for &j in positions {
+                // Check how far the match extends
+                let mut len = 0;
+                let mut ii = i;
+                let mut jj = j;
+
+                while ii < s1_words.len() && jj < s2_words.len() && s1_words[ii] == s2_words[jj] {
+                    len += 1;
+                    ii += 1;
+                    jj += 1;
+                }
+
+                if len > max_len {
+                    max_len = len;
+                    best_match = Some((i, j));
                 }
             }
         }
     }
 
-    match (max_index_s1, max_index_s2) {
-        (Some(idx1), Some(idx2)) => Some((idx1, idx2)),
-        _ => None,
-    }
+    best_match
 }

@@ -1,0 +1,424 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Frontend Testing and Quality Checks
+  frontend:
+    name: Frontend CI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./web-app
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: web-app/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Type checking
+      run: npm run type-check
+
+    - name: Linting
+      run: npm run lint
+
+    - name: Format checking
+      run: npx prettier --check .
+
+    - name: Run tests
+      run: npm run test -- --coverage --watchAll=false
+      env:
+        CI: true
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./web-app/coverage/lcov.info
+        flags: frontend
+        name: frontend-coverage
+        fail_ci_if_error: false
+
+    - name: Build application
+      run: npm run build
+      env:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_WS_URL: ws://localhost:8000
+        NEXT_PUBLIC_MICROSOFT_CLIENT_ID: test-client-id
+        NEXT_PUBLIC_MICROSOFT_TENANT_ID: test-tenant-id
+
+    - name: Check bundle size
+      run: npm run build:analyze
+      continue-on-error: true
+
+  # Backend Testing and Quality Checks
+  backend:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./api
+
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: meetily_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest-cov black isort mypy
+
+    - name: Code formatting check (Black)
+      run: black --check .
+
+    - name: Import sorting check (isort)
+      run: isort --check-only .
+
+    - name: Type checking (MyPy)
+      run: mypy .
+      continue-on-error: true
+
+    - name: Run database migrations
+      run: alembic upgrade head
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/meetily_test
+        REDIS_URL: redis://localhost:6379
+        JWT_SECRET_KEY: test-secret-key-for-ci
+
+    - name: Run tests with coverage
+      run: pytest --cov=app --cov-report=xml --cov-report=html -v
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/meetily_test
+        REDIS_URL: redis://localhost:6379
+        JWT_SECRET_KEY: test-secret-key-for-ci
+        ENVIRONMENT: test
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./api/coverage.xml
+        flags: backend
+        name: backend-coverage
+        fail_ci_if_error: false
+
+  # Security and Dependency Checks
+  security:
+    name: Security Checks
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Setup Node.js for npm audit
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+
+    - name: Frontend dependency audit
+      run: |
+        cd web-app
+        npm audit --audit-level high
+      continue-on-error: true
+
+    - name: Setup Python for safety check
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Backend dependency security check
+      run: |
+        cd api
+        pip install safety
+        safety check
+      continue-on-error: true
+
+  # Integration Tests
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [frontend, backend]
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: meetily_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: web-app/package-lock.json
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install backend dependencies
+      run: |
+        cd api
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Install frontend dependencies
+      run: |
+        cd web-app
+        npm ci
+
+    - name: Start backend server
+      run: |
+        cd api
+        alembic upgrade head
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+        sleep 10
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/meetily_test
+        REDIS_URL: redis://localhost:6379
+        JWT_SECRET_KEY: test-secret-key-for-ci
+        ENVIRONMENT: test
+
+    - name: Build frontend
+      run: |
+        cd web-app
+        npm run build
+      env:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_WS_URL: ws://localhost:8000
+        NEXT_PUBLIC_MICROSOFT_CLIENT_ID: test-client-id
+        NEXT_PUBLIC_MICROSOFT_TENANT_ID: test-tenant-id
+
+    - name: Start frontend server
+      run: |
+        cd web-app
+        npm start &
+        sleep 10
+      env:
+        NODE_ENV: production
+
+    - name: Wait for services to be ready
+      run: |
+        timeout 60s bash -c 'until curl -f http://localhost:8000/health; do sleep 2; done'
+        timeout 60s bash -c 'until curl -f http://localhost:3000; do sleep 2; done'
+
+    - name: Run integration tests
+      run: |
+        cd web-app
+        npm run test:integration
+      env:
+        API_URL: http://localhost:8000
+        FRONTEND_URL: http://localhost:3000
+      continue-on-error: true
+
+  # Quality Gates
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: [frontend, backend, security]
+    if: always()
+
+    steps:
+    - name: Check job results
+      run: |
+        if [[ "${{ needs.frontend.result }}" == "failure" || "${{ needs.backend.result }}" == "failure" ]]; then
+          echo "Critical jobs failed"
+          exit 1
+        fi
+        
+        if [[ "${{ needs.security.result }}" == "failure" ]]; then
+          echo "Security checks failed - review required"
+          # Don't fail the build for security issues, but flag for review
+        fi
+        
+        echo "Quality gate passed"
+
+  # Deploy Preview (for PRs)
+  deploy-preview:
+    name: Deploy Preview
+    runs-on: ubuntu-latest
+    needs: [quality-gate]
+    if: github.event_name == 'pull_request' && needs.quality-gate.result == 'success'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to preview environment
+      run: |
+        echo "Deploying to preview environment for PR #${{ github.event.number }}"
+        # Add preview deployment logic here
+        # This could deploy to Railway.app preview environment or similar
+
+    - name: Comment PR with preview URL
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: '🔍 Preview deployment ready at: https://pr-${{ github.event.number }}.preview.meetingly.app'
+          })
+
+  # Performance Testing
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [integration]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+
+    - name: Install Lighthouse CI
+      run: npm install -g @lhci/cli@0.12.x
+
+    - name: Run Lighthouse CI
+      run: |
+        lhci autorun
+      env:
+        LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+      continue-on-error: true
+
+    - name: Load testing with Artillery
+      run: |
+        npm install -g artillery
+        cd api
+        # Add artillery configuration and run load tests
+        echo "Load testing would run here"
+      continue-on-error: true
+
+# Job Summary
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [frontend, backend, security, integration, quality-gate]
+    if: always()
+
+    steps:
+    - name: Generate summary
+      run: |
+        echo "## CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Frontend | ${{ needs.frontend.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Backend | ${{ needs.backend.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Integration | ${{ needs.integration.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Quality Gate | ${{ needs.quality-gate.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ needs.quality-gate.result }}" == "success" ]]; then
+          echo "✅ **All quality checks passed!**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Some quality checks failed - review required**" >> $GITHUB_STEP_SUMMARY
+        fi

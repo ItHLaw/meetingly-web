@@ -1,0 +1,29 @@
+# Build outputs
+.next/
+out/
+dist/
+build/
+
+# Dependencies
+node_modules/
+
+# Environment files
+.env*
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Cache
+.cache/
+.eslintcache
+
+# Generated files
+*.generated.*
+coverage/
+
+# Documentation
+*.md

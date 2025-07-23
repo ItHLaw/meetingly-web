@@ -1,0 +1,146 @@
+# Pre-commit hooks for code quality and consistency
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.(md|rst)$
+      - id: end-of-file-fixer
+        exclude: \.(md|rst)$
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Frontend (web-app) checks
+  - repo: local
+    hooks:
+      - id: frontend-lint
+        name: Frontend ESLint
+        entry: bash -c 'cd web-app && npm run lint'
+        language: system
+        files: ^web-app/.*\.(ts|tsx|js|jsx)$
+        pass_filenames: false
+
+      - id: frontend-type-check
+        name: Frontend TypeScript Check
+        entry: bash -c 'cd web-app && npm run type-check'
+        language: system
+        files: ^web-app/.*\.(ts|tsx)$
+        pass_filenames: false
+
+      - id: frontend-prettier
+        name: Frontend Prettier Check
+        entry: bash -c 'cd web-app && npm run format:check'
+        language: system
+        files: ^web-app/.*\.(ts|tsx|js|jsx|json|md)$
+        pass_filenames: false
+
+      - id: frontend-tests
+        name: Frontend Unit Tests
+        entry: bash -c 'cd web-app && npm run test -- --watchAll=false --passWithNoTests'
+        language: system
+        files: ^web-app/.*\.(ts|tsx)$
+        pass_filenames: false
+
+  # Backend (api) checks
+  - repo: local
+    hooks:
+      - id: backend-lint
+        name: Backend Python Lint (flake8)
+        entry: bash -c 'cd api && python -m flake8 .'
+        language: system
+        files: ^api/.*\.py$
+        pass_filenames: false
+
+      - id: backend-format-check
+        name: Backend Python Format Check (black)
+        entry: bash -c 'cd api && python -m black --check .'
+        language: system
+        files: ^api/.*\.py$
+        pass_filenames: false
+
+      - id: backend-import-sort
+        name: Backend Import Sorting (isort)
+        entry: bash -c 'cd api && python -m isort --check-only .'
+        language: system
+        files: ^api/.*\.py$
+        pass_filenames: false
+
+      - id: backend-type-check
+        name: Backend Type Check (mypy)
+        entry: bash -c 'cd api && python -m mypy app/'
+        language: system
+        files: ^api/.*\.py$
+        pass_filenames: false
+
+      - id: backend-security-check
+        name: Backend Security Check (bandit)
+        entry: bash -c 'cd api && python -m bandit -r app/ -f json -o bandit-report.json || python -m bandit -r app/'
+        language: system
+        files: ^api/.*\.py$
+        pass_filenames: false
+
+      - id: backend-tests
+        name: Backend Unit Tests
+        entry: bash -c 'cd api && python -m pytest tests/ -v --tb=short'
+        language: system
+        files: ^api/.*\.py$
+        pass_filenames: false
+
+  # Security and secrets checking
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: package-lock\.json|poetry\.lock|\.git/|\.pytest_cache/|node_modules/
+
+  # Docker checks
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks:
+      - id: hadolint-docker
+        files: Dockerfile.*
+
+  # Markdown and documentation
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.38.0
+    hooks:
+      - id: markdownlint
+        args: [--fix]
+        files: \.(md|markdown)$
+
+  # Commit message formatting
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.13.0
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+
+# Global exclusions
+exclude: |
+  (?x)^(
+    .*\.min\.(js|css)$|
+    .*\.map$|
+    node_modules/|
+    \.next/|
+    \.git/|
+    __pycache__/|
+    \.pytest_cache/|
+    coverage/|
+    dist/|
+    build/|
+    \.env.*|
+    \.DS_Store
+  )$

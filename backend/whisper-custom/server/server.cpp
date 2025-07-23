@@ -12,6 +12,9 @@
 #include <vector>
 #include <cstring>
 #include <sstream>
+#include <random>
+#include <iomanip>
+#include <chrono>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -28,6 +31,57 @@ const std::string text_format   = "text";
 const std::string srt_format    = "srt";
 const std::string vjson_format  = "verbose_json";
 const std::string vtt_format    = "vtt";
+
+// Generate secure temporary filename
+std::string generate_temp_filename(const std::string& prefix = "whisper-server", const std::string& suffix = ".wav") {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(100000, 999999);
+    
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    
+    std::ostringstream filename;
+    filename << "/tmp/" << prefix << "_" << timestamp << "_" << dis(gen) << suffix;
+    return filename.str();
+}
+
+// RAII class for temporary file cleanup
+class TempFileGuard {
+public:
+    explicit TempFileGuard(const std::string& filename) : filename_(filename) {}
+    
+    ~TempFileGuard() {
+        if (!filename_.empty()) {
+            std::remove(filename_.c_str());
+        }
+    }
+    
+    // Disable copy constructor and assignment
+    TempFileGuard(const TempFileGuard&) = delete;
+    TempFileGuard& operator=(const TempFileGuard&) = delete;
+    
+    // Allow move constructor and assignment
+    TempFileGuard(TempFileGuard&& other) noexcept : filename_(std::move(other.filename_)) {
+        other.filename_.clear();
+    }
+    
+    TempFileGuard& operator=(TempFileGuard&& other) noexcept {
+        if (this != &other) {
+            if (!filename_.empty()) {
+                std::remove(filename_.c_str());
+            }
+            filename_ = std::move(other.filename_);
+            other.filename_.clear();
+        }
+        return *this;
+    }
+    
+    const std::string& get() const { return filename_; }
+    
+private:
+    std::string filename_;
+};
 
 struct server_params
 {
@@ -226,7 +280,10 @@ void check_ffmpeg_availibility() {
 
 bool convert_to_wav(const std::string & temp_filename, std::string & error_resp) {
     std::ostringstream cmd_stream;
-    std::string converted_filename_temp = temp_filename + "_temp.wav";
+    // Use secure temporary filename for conversion output
+    std::string converted_filename_temp = generate_temp_filename("whisper-converted", ".wav");
+    TempFileGuard converted_guard(converted_filename_temp);
+    
     cmd_stream << "ffmpeg -i \"" << temp_filename << "\" -y -ar 16000 -ac 1 -c:a pcm_s16le \"" << converted_filename_temp << "\" 2>&1";
     std::string cmd = cmd_stream.str();
 
@@ -247,6 +304,9 @@ bool convert_to_wav(const std::string & temp_filename, std::string & error_resp)
         error_resp = "{\"error\":\"Failed to rename the temporary file.\"}";
         return false;
     }
+    
+    // Release the guard since we've successfully renamed the file
+    converted_guard = TempFileGuard("");
     return true;
 }
 
@@ -711,13 +771,22 @@ int main(int argc, char ** argv) {
 
         if (sparams.ffmpeg_converter) {
             // if file is not wav, convert to wav
-            // write to temporary file
-            //const std::string temp_filename_base = std::tmpnam(nullptr);
-            const std::string temp_filename_base = "whisper-server-tmp"; // TODO: this is a hack, remove when the mutext is removed
-            const std::string temp_filename = temp_filename_base + ".wav";
-            std::ofstream temp_file{temp_filename, std::ios::binary};
-            temp_file << audio_file.content;
-            temp_file.close();
+            // write to temporary file with secure filename and automatic cleanup
+            const std::string temp_filename = generate_temp_filename();
+            TempFileGuard temp_guard(temp_filename);
+            
+            {
+                std::ofstream temp_file{temp_filename, std::ios::binary};
+                if (!temp_file.is_open()) {
+                    fprintf(stderr, "[ERROR] Failed to create temporary file '%s'\n", temp_filename.c_str());
+                    fflush(stderr);
+                    const std::string error_resp = "{\"error\":\"failed to create temporary file\"}";
+                    res.set_content(error_resp, "application/json");
+                    return;
+                }
+                temp_file << audio_file.content;
+                temp_file.close();
+            }
 
             std::string error_resp = "{\"error\":\"Failed to execute ffmpeg command.\"}";
             const bool is_converted = convert_to_wav(temp_filename, error_resp);
@@ -733,11 +802,9 @@ int main(int argc, char ** argv) {
                 fflush(stderr);
                 const std::string error_resp = "{\"error\":\"failed to read WAV file\"}";
                 res.set_content(error_resp, "application/json");
-                std::remove(temp_filename.c_str());
                 return;
             }
-            // remove temp file
-            std::remove(temp_filename.c_str());
+            // Temporary file will be automatically cleaned up by TempFileGuard destructor
         } else {
             if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize))
             {

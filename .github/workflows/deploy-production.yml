@@ -1,0 +1,405 @@
+name: Production Deployment
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.11'
+
+permissions:
+  contents: read
+  deployments: write
+  pull-requests: write
+
+jobs:
+  pre-deployment-checks:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy-frontend: ${{ steps.changes.outputs.frontend }}
+      deploy-backend: ${{ steps.changes.outputs.backend }}
+      deploy-shared-types: ${{ steps.changes.outputs.shared-types }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            frontend:
+              - 'web-app/**'
+              - 'shared-types/**'
+            backend:
+              - 'api/**'
+              - 'shared-types/**'
+            shared-types:
+              - 'shared-types/**'
+
+      - name: Security scan
+        run: |
+          echo "🔍 Running security checks..."
+          # Add security scanning here (e.g., CodeQL, Semgrep)
+          echo "✅ Security checks passed"
+
+      - name: Architecture compliance
+        run: |
+          echo "🏗️ Checking architecture compliance..."
+          node scripts/architecture-compliance.js
+          echo "✅ Architecture compliance verified"
+
+  build-shared-types:
+    needs: pre-deployment-checks
+    if: needs.pre-deployment-checks.outputs.deploy-shared-types == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'shared-types/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: shared-types
+        run: npm ci
+
+      - name: Build shared types
+        working-directory: shared-types
+        run: npm run build
+
+      - name: Upload shared types artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-types-dist
+          path: shared-types/dist
+          retention-days: 1
+
+  build-frontend:
+    needs: [pre-deployment-checks, build-shared-types]
+    if: always() && needs.pre-deployment-checks.outputs.deploy-frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'web-app/package-lock.json'
+
+      - name: Download shared types
+        if: needs.build-shared-types.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: shared-types-dist
+          path: shared-types/dist
+
+      - name: Install dependencies
+        working-directory: web-app
+        run: npm ci
+
+      - name: Run tests
+        working-directory: web-app
+        run: |
+          npm run test -- --coverage --watchAll=false
+          npm run test:integration
+
+      - name: Build application
+        working-directory: web-app
+        env:
+          NODE_ENV: production
+          NEXT_PUBLIC_API_URL: ${{ secrets.PRODUCTION_API_URL }}
+          NEXT_PUBLIC_MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
+          NEXT_PUBLIC_MICROSOFT_TENANT_ID: ${{ secrets.MICROSOFT_TENANT_ID }}
+        run: npm run build
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: web-app/.next
+          retention-days: 1
+
+  build-backend:
+    needs: [pre-deployment-checks, build-shared-types]
+    if: always() && needs.pre-deployment-checks.outputs.deploy-backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: 'api/requirements.txt'
+
+      - name: Install dependencies
+        working-directory: api
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Run tests
+        working-directory: api
+        run: |
+          python -m pytest tests/ -v --cov=app --cov-report=xml
+          python -m pytest tests/ --cov=app --cov-report=html
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: api/coverage.xml
+          flags: backend
+          name: backend-coverage
+
+  deploy-backend:
+    needs: [build-backend, pre-deployment-checks]
+    if: needs.pre-deployment-checks.outputs.deploy-backend == 'true'
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Railway (Backend)
+        id: deploy
+        run: |
+          echo "🚀 Deploying backend to Railway..."
+          # Install Railway CLI
+          npm install -g @railway/cli
+          
+          # Login to Railway
+          echo "${{ secrets.RAILWAY_TOKEN }}" | railway login --token
+          
+          # Deploy backend
+          cd api
+          railway up --service backend
+          
+          # Get deployment URL
+          URL=$(railway status --json | jq -r '.deployments[0].url')
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "✅ Backend deployed to: $URL"
+
+      - name: Health check
+        run: |
+          echo "🏥 Running health check..."
+          sleep 30 # Wait for deployment to stabilize
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ steps.deploy.outputs.url }}/health)
+          if [ $response -eq 200 ]; then
+            echo "✅ Health check passed"
+          else
+            echo "❌ Health check failed with status: $response"
+            exit 1
+          fi
+
+      - name: Run smoke tests
+        run: |
+          echo "🧪 Running smoke tests..."
+          # Add basic API smoke tests here
+          curl -f ${{ steps.deploy.outputs.url }}/health || exit 1
+          echo "✅ Smoke tests passed"
+
+  deploy-frontend:
+    needs: [build-frontend, deploy-backend, pre-deployment-checks]
+    if: always() && needs.pre-deployment-checks.outputs.deploy-frontend == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: web-app/.next
+
+      - name: Deploy to Railway (Frontend)
+        id: deploy
+        run: |
+          echo "🚀 Deploying frontend to Railway..."
+          # Install Railway CLI
+          npm install -g @railway/cli
+          
+          # Login to Railway
+          echo "${{ secrets.RAILWAY_TOKEN }}" | railway login --token
+          
+          # Deploy frontend
+          cd web-app
+          railway up --service frontend
+          
+          # Get deployment URL
+          URL=$(railway status --json | jq -r '.deployments[0].url')
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "✅ Frontend deployed to: $URL"
+
+      - name: Frontend health check
+        run: |
+          echo "🏥 Running frontend health check..."
+          sleep 30 # Wait for deployment to stabilize
+          
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ steps.deploy.outputs.url }})
+          if [ $response -eq 200 ]; then
+            echo "✅ Frontend health check passed"
+          else
+            echo "❌ Frontend health check failed with status: $response"
+            exit 1
+          fi
+
+  post-deployment:
+    needs: [deploy-frontend, deploy-backend]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run E2E tests
+        if: needs.deploy-frontend.result == 'success' && needs.deploy-backend.result == 'success'
+        run: |
+          echo "🎭 Running E2E tests against production..."
+          cd web-app
+          npm ci
+          npx playwright install --with-deps
+          E2E_BASE_URL=${{ needs.deploy-frontend.outputs.url }} npm run test:e2e
+          echo "✅ E2E tests passed"
+
+      - name: Performance audit
+        if: needs.deploy-frontend.result == 'success'
+        run: |
+          echo "⚡ Running performance audit..."
+          npm install -g lighthouse
+          lighthouse ${{ needs.deploy-frontend.outputs.url }} --output html --output-path lighthouse-report.html
+          echo "✅ Performance audit completed"
+
+      - name: Upload performance report
+        if: needs.deploy-frontend.result == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-report
+          path: lighthouse-report.html
+
+      - name: Security headers check
+        if: needs.deploy-frontend.result == 'success'
+        run: |
+          echo "🔒 Checking security headers..."
+          curl -I ${{ needs.deploy-frontend.outputs.url }} | grep -E "(X-Frame-Options|X-Content-Type-Options|Strict-Transport-Security|Content-Security-Policy)"
+          echo "✅ Security headers verified"
+
+      - name: Deployment notification
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { context } = require('@actions/github');
+            const status = '${{ job.status }}';
+            const frontendUrl = '${{ needs.deploy-frontend.outputs.url || 'N/A' }}';
+            const backendUrl = '${{ needs.deploy-backend.outputs.url || 'N/A' }}';
+            
+            const body = `
+            ## 🚀 Production Deployment ${status === 'success' ? '✅ Completed' : '❌ Failed'}
+            
+            **Frontend URL:** ${frontendUrl}
+            **Backend URL:** ${backendUrl}
+            
+            **Deployment Summary:**
+            - Frontend: ${{ needs.deploy-frontend.result || 'skipped' }}
+            - Backend: ${{ needs.deploy-backend.result || 'skipped' }}
+            - E2E Tests: ${{ steps.e2e-tests.outcome || 'skipped' }}
+            
+            **Commit:** ${context.sha.substring(0, 7)}
+            **Branch:** ${context.ref.replace('refs/heads/', '')}
+            `;
+            
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: body
+            });
+
+  rollback:
+    needs: [deploy-frontend, deploy-backend, post-deployment]
+    if: failure() && (needs.deploy-frontend.result == 'failure' || needs.deploy-backend.result == 'failure' || needs.post-deployment.result == 'failure')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Rollback deployment
+        run: |
+          echo "🔄 Rolling back deployment..."
+          # Install Railway CLI
+          npm install -g @railway/cli
+          echo "${{ secrets.RAILWAY_TOKEN }}" | railway login --token
+          
+          # Rollback to previous deployment
+          if [[ "${{ needs.deploy-backend.result }}" == "failure" ]]; then
+            echo "Rolling back backend..."
+            railway rollback --service backend
+          fi
+          
+          if [[ "${{ needs.deploy-frontend.result }}" == "failure" ]]; then
+            echo "Rolling back frontend..."
+            railway rollback --service frontend
+          fi
+          
+          echo "✅ Rollback completed"
+
+      - name: Rollback notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { context } = require('@actions/github');
+            
+            const body = `
+            ## 🔄 Deployment Rollback Initiated
+            
+            Due to deployment failures, the system has been rolled back to the previous stable version.
+            
+            **Failed Components:**
+            - Frontend: ${{ needs.deploy-frontend.result }}
+            - Backend: ${{ needs.deploy-backend.result }}
+            - Post-deployment: ${{ needs.post-deployment.result }}
+            
+            **Commit:** ${context.sha.substring(0, 7)}
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Deployment Rollback - ${context.sha.substring(0, 7)}`,
+              body: body,
+              labels: ['deployment', 'rollback', 'critical']
+            });

@@ -1,0 +1,201 @@
+name: 'Dependency Review'
+
+on:
+  pull_request:
+    paths:
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/requirements.txt'
+      - '**/poetry.lock'
+      - '**/Dockerfile'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Dependency Review'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unlicense
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-1.0, AGPL-3.0
+          comment-summary-in-pr: true
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 120
+
+  security-audit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: ['web-app', 'frontend', 'shared-types']
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: '${{ matrix.directory }}/package-lock.json'
+
+      - name: 'Install Dependencies'
+        working-directory: ${{ matrix.directory }}
+        run: npm ci
+
+      - name: 'Run Security Audit'
+        working-directory: ${{ matrix.directory }}
+        run: npm audit --audit-level=high
+
+      - name: 'Check for Known Vulnerabilities'
+        working-directory: ${{ matrix.directory }}
+        run: |
+          if npm audit --audit-level=high --json | jq '.vulnerabilities | length' | grep -v '^0$'; then
+            echo "❌ High-severity vulnerabilities found"
+            npm audit --audit-level=high
+            exit 1
+          else
+            echo "✅ No high-severity vulnerabilities found"
+          fi
+
+  python-security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Setup Python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 'Install Safety'
+        run: pip install safety
+
+      - name: 'Check Python Dependencies for Security Issues'
+        working-directory: api
+        run: |
+          pip install -r requirements.txt
+          safety check --json --output safety-report.json || true
+          
+          if [ -f safety-report.json ]; then
+            vulnerabilities=$(jq '.vulnerabilities | length' safety-report.json)
+            if [ "$vulnerabilities" -gt 0 ]; then
+              echo "❌ Security vulnerabilities found in Python dependencies"
+              cat safety-report.json
+              exit 1
+            else
+              echo "✅ No security vulnerabilities found in Python dependencies"
+            fi
+          fi
+
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 'Install License Checker'
+        run: npm install -g license-checker
+
+      - name: 'Check Frontend Licenses'
+        working-directory: web-app
+        run: |
+          npm ci
+          license-checker --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;Unlicense' --excludePrivatePackages
+
+      - name: 'Check Desktop App Licenses'
+        working-directory: frontend
+        run: |
+          npm ci
+          license-checker --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;Unlicense' --excludePrivatePackages
+
+      - name: 'Check Shared Types Licenses'
+        working-directory: shared-types
+        run: |
+          npm ci
+          license-checker --onlyAllow 'MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;Unlicense' --excludePrivatePackages
+
+  dependency-analysis:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 'Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 'Install Dependencies Analysis Tools'
+        run: |
+          npm install -g npm-check-updates
+          npm install -g depcheck
+
+      - name: 'Analyze Dependency Changes'
+        run: |
+          echo "## 📦 Dependency Analysis" >> dependency-analysis.md
+          echo "" >> dependency-analysis.md
+          
+          # Check for outdated dependencies
+          echo "### Outdated Dependencies" >> dependency-analysis.md
+          echo "\`\`\`" >> dependency-analysis.md
+          
+          for dir in web-app frontend shared-types; do
+            if [ -f "$dir/package.json" ]; then
+              echo "=== $dir ===" >> dependency-analysis.md
+              cd "$dir"
+              ncu --format group >> ../dependency-analysis.md || true
+              cd ..
+            fi
+          done
+          
+          echo "\`\`\`" >> dependency-analysis.md
+          echo "" >> dependency-analysis.md
+          
+          # Check for unused dependencies
+          echo "### Unused Dependencies" >> dependency-analysis.md
+          echo "\`\`\`" >> dependency-analysis.md
+          
+          for dir in web-app frontend shared-types; do
+            if [ -f "$dir/package.json" ]; then
+              echo "=== $dir ===" >> dependency-analysis.md
+              cd "$dir"
+              npx depcheck --json | jq -r '.dependencies[]?' >> ../dependency-analysis.md || true
+              cd ..
+            fi
+          done
+          
+          echo "\`\`\`" >> dependency-analysis.md
+
+      - name: 'Comment Analysis Results'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            if (fs.existsSync('dependency-analysis.md')) {
+              const analysis = fs.readFileSync('dependency-analysis.md', 'utf8');
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: analysis
+              });
+            }
