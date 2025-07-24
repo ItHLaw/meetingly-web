@@ -1,5 +1,9 @@
 # Railway.app Deployment Guide
 
+## ⚠️ IMPORTANT: Multi-Service Setup Required
+
+**The Nixpacks error occurs because this is a multi-service repository.** You need to deploy each service separately, not from the root directory.
+
 This document provides comprehensive instructions for deploying the Meetily web application to Railway.app.
 
 ## Overview
@@ -21,16 +25,39 @@ Plus two managed services:
 
 ## Deployment Steps
 
-### 1. Initial Setup
+### 1. Create Project and Services
+
+**In Railway Dashboard:**
+
+1. **Create New Project** from your GitHub repository
+2. **Delete the auto-created service** (it's trying to build from root)
+3. **Create API Service:**
+   - Click "New Service" → "GitHub Repo"
+   - Set **Source Directory**: `api`
+   - Railway will detect the Dockerfile automatically
+4. **Create Web-App Service:**
+   - Click "New Service" → "GitHub Repo" 
+   - Set **Source Directory**: `web-app`
+   - Railway will detect the Dockerfile automatically
+5. **Add Database Services:**
+   - Click "New Service" → "Database" → "PostgreSQL"
+   - Click "New Service" → "Database" → "Redis"
+
+**Alternative: CLI Setup**
 
 ```bash
 # Login to Railway
 railway login
 
-# Link to existing project or create new one
-railway link
-# OR
+# Create project
 railway init
+
+# Deploy services individually
+cd api
+railway up --service api
+
+cd ../web-app  
+railway up --service web-app
 ```
 
 ### 2. Environment Variables Setup

@@ -1,0 +1,7 @@
+# This repository contains multiple services
+# Deploy each service separately:
+# 1. Create services in Railway dashboard
+# 2. Set source directory for each service:
+#    - API service: ./api
+#    - Web-app service: ./web-app
+# 3. Each service has its own Dockerfile
